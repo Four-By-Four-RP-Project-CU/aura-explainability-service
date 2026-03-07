@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+outputs/
+storage/
+data/train_split.csv
+data/val_split.csv
+checkpoints/
