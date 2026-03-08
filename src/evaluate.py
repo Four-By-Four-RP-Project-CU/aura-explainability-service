@@ -75,7 +75,7 @@ def main() -> None:
     model_name = checkpoint.get("model_name", "resnet18")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(model_name, num_classes=2).to(device)
+    model = build_model(model_name, num_classes=2, pretrained=False).to(device)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 

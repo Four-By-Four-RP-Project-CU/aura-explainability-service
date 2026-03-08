@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
 from dataset import CsvImageDataset
@@ -36,13 +36,32 @@ def freeze_backbone(model, model_name: str) -> None:
             param.requires_grad = True
 
 
-def unfreeze_last_block(model, model_name: str) -> None:
+def count_trainable_params(model) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def unfreeze_last_block(model, model_name: str, unfreeze_last: int) -> None:
     if model_name == "efficientnet_b0":
-        for param in model.features[-2].parameters():
-            param.requires_grad = True
+        if not hasattr(model, "features"):
+            print("WARNING: model.features not found; keeping classifier-only training.")
+            return
+        # Freeze all feature blocks first.
+        for param in model.features.parameters():
+            param.requires_grad = False
+        num_children = len(model.features)
+        blocks_to_unfreeze = max(0, int(unfreeze_last))
+        start_idx = max(0, num_children - blocks_to_unfreeze)
+        for i in range(start_idx, num_children):
+            for param in model.features[i].parameters():
+                param.requires_grad = True
         for param in model.classifier.parameters():
             param.requires_grad = True
+        print(
+            f"EfficientNet unfreeze: requested last={unfreeze_last}, "
+            f"using blocks [{start_idx}:{num_children}]"
+        )
     else:
+        # ResNet fallback: keep prior behavior and ensure classifier remains trainable.
         for param in model.layer4.parameters():
             param.requires_grad = True
         for param in model.fc.parameters():
@@ -73,8 +92,15 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="checkpoints/best.pt")
-    parser.add_argument("--mode", default="eval", choices=["eval", "demo"])
+    parser.add_argument("--mode", default="eval", choices=["train", "eval", "demo"])
     parser.add_argument("--thresholds", default="0.5,0.6,0.7", help="Comma-separated positive class thresholds.")
+    parser.add_argument(
+        "--unfreeze-last",
+        type=int,
+        default=0,
+        help="Number of last feature blocks to unfreeze during stage-2 (0 = keep existing stage-2 default behavior)",
+    )
+    parser.add_argument("--load-from", default="", help="Optional checkpoint path to initialize model weights")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -113,6 +139,16 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(args.model, num_classes=2).to(device)
+    if args.load_from:
+        checkpoint_path = Path(args.load_from)
+        if not checkpoint_path.exists():
+            raise SystemExit(f"Missing checkpoint to load: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        state_dict = checkpoint.get("state_dict") or checkpoint.get("model_state_dict")
+        if state_dict is None:
+            raise SystemExit("Checkpoint missing model weights (state_dict/model_state_dict)")
+        model.load_state_dict(state_dict, strict=True)
+        print(f"Loaded model weights from: {checkpoint_path}")
 
     class_counts = np.bincount(train_labels, minlength=2)
     total = class_counts.sum()
@@ -129,16 +165,71 @@ def main() -> None:
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    stage1_epochs = min(8, max(5, args.epochs // 5))
-    stage2_epochs = max(1, args.epochs - stage1_epochs)
+    if args.unfreeze_last > 0 and args.lr > 1e-4:
+        print("Warning: High LR detected with unfreeze - scaling down to 1e-5")
+        args.lr = 1e-5
 
-    freeze_backbone(model, args.model)
+    if args.model == "efficientnet_b0" and args.unfreeze_last > 0:
+        print("=== DEBUG: UNFREEZE AFTER LOADING CHECKPOINT ===")
+        print(
+            "Before unfreeze - requires_grad status of first feature param: "
+            f"{next(model.features.parameters()).requires_grad}"
+        )
+        print("Applying unfreeze: freezing all features first")
+        try:
+            for param in model.features.parameters():
+                param.requires_grad = False
+            for param in model.classifier.parameters():
+                param.requires_grad = True
+
+            num_blocks = len(model.features)
+            print(f"model.features has {num_blocks} children (should be ~9 for B0)")
+            start_idx = max(0, num_blocks - args.unfreeze_last)
+            print(
+                f"Unfreezing from index {start_idx} to {num_blocks - 1} "
+                f"(last {args.unfreeze_last} blocks)"
+            )
+            for i in range(start_idx, num_blocks):
+                block = model.features[i]
+                for param in model.features[i].parameters():
+                    param.requires_grad = True
+                trainable_in_block = sum(1 for p in block.parameters() if p.requires_grad)
+                print(f"  Block {i}: {trainable_in_block} params set to requires_grad=True")
+
+            trainable = sum(1 for p in model.parameters() if p.requires_grad)
+            total = sum(1 for p in model.parameters())
+            trainable_params_numel = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(
+                f"=== AFTER UNFROZE: Trainable layers: {trainable}/{total} | "
+                f"Trainable params: {trainable_params_numel:,} "
+                f"({trainable_params_numel / max(1, sum(p.numel() for p in model.parameters())) * 100:.2f}%) ==="
+            )
+        except Exception as ex:
+            print(f"WARNING: EfficientNet unfreeze failed ({ex}); using head-only mode")
+            freeze_backbone(model, args.model)
+            print(f"Head-only stage trainable parameters: {count_trainable_params(model):,}")
+    else:
+        freeze_backbone(model, args.model)
+        print(f"Head-only stage trainable parameters: {count_trainable_params(model):,}")
+
     optimizer = AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=1e-3,
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scheduler = CosineAnnealingLR(optimizer, T_max=stage1_epochs)
+    print(
+        f"Optimizer created with {len(optimizer.param_groups[0]['params'])} parameters "
+        f"(trainable tensors in first group)"
+    )
+    print(f"Initial LR set to {args.lr:.2e}")
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=4,
+        min_lr=1e-7,
+    )
+    print(f"Starting training with LR={args.lr}, unfreeze-last={args.unfreeze_last}")
 
     def run_epoch(epoch_index, total_epochs):
         nonlocal best_f1, best_threshold
@@ -186,7 +277,7 @@ def main() -> None:
         ]
         val_metrics = max(threshold_metrics, key=lambda metric: metric.f1)
 
-        lr_value = scheduler.get_last_lr()[0]
+        lr_value = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch_index}: lr={lr_value:.2e} "
             f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
@@ -208,27 +299,14 @@ def main() -> None:
                 output_path,
             )
 
-        scheduler.step()
+        scheduler.step(val_loss)
 
         if stopper.step(val_loss):
             print("Early stopping triggered.")
             return True
         return False
 
-    for epoch in range(1, stage1_epochs + 1):
-        if run_epoch(epoch, args.epochs):
-            print(f"Best model saved to {output_path}")
-            return
-
-    unfreeze_last_block(model, args.model)
-    optimizer = AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-    scheduler = CosineAnnealingLR(optimizer, T_max=stage2_epochs)
-
-    for epoch in range(stage1_epochs + 1, args.epochs + 1):
+    for epoch in range(1, args.epochs + 1):
         if run_epoch(epoch, args.epochs):
             break
     print(f"Best model saved to {output_path} (best_threshold={best_threshold:.2f})")

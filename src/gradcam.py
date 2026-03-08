@@ -9,6 +9,10 @@ try:
     import cv2  # type: ignore
 except Exception:
     cv2 = None
+try:
+    import matplotlib.cm as mpl_cm  # type: ignore
+except Exception:
+    mpl_cm = None
 
 from model import build_model
 from transforms import get_val_transforms
@@ -106,6 +110,20 @@ def _postprocess_cam(cam: np.ndarray, enhanced: bool) -> np.ndarray:
     return cam_blur / max_val if max_val > 0 else cam_blur
 
 
+def _resolve_cv2_colormap(colormap: str):
+    if cv2 is None:
+        return None
+    key = (colormap or "jet").strip().lower()
+    mapping = {
+        "jet": cv2.COLORMAP_JET,
+        "hot": cv2.COLORMAP_HOT,
+        "plasma": cv2.COLORMAP_PLASMA,
+        "inferno": cv2.COLORMAP_INFERNO,
+        "turbo": cv2.COLORMAP_TURBO,
+    }
+    return mapping.get(key, cv2.COLORMAP_JET)
+
+
 def build_lesion_mask(image: Image.Image) -> np.ndarray:
     rgb = np.array(image.convert("RGB"))
     h, w = rgb.shape[:2]
@@ -154,8 +172,8 @@ def build_cam_maps(
     image_size: tuple[int, int],
     lesion_mask: np.ndarray | None = None,
     apply_blur: bool = True,
-    percentile: int = 35,
-    blur_kernel: int = 9,
+    percentile: int = 75,
+    blur_kernel: int = 11,
 ) -> tuple[np.ndarray, np.ndarray]:
     raw_cam = np.clip(cam, 0, 1)
     raw_cam = raw_cam / (raw_cam.max() + 1e-8)
@@ -181,36 +199,42 @@ def build_cam_maps(
     return raw_resized, masked_cam
 
 
-def heatmap_image(cam: np.ndarray, image_size: tuple[int, int], enhanced: bool = True) -> Image.Image:
+def heatmap_image(
+    cam: np.ndarray,
+    image_size: tuple[int, int],
+    enhanced: bool = True,
+    colormap: str = "jet",
+) -> Image.Image:
     cam = _postprocess_cam(cam, enhanced)
     if cv2 is not None:
         cam_resized = cv2.resize(cam, image_size)
         heatmap = np.uint8(255 * cam_resized)
-        heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        heatmap = cv2.applyColorMap(heatmap, _resolve_cv2_colormap(colormap))
         heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
         return Image.fromarray(heatmap)
 
-    cam_image = Image.fromarray(np.uint8(255 * cam)).resize(image_size)
-    cam_image = cam_image.convert("RGBA")
-    heatmap = cam_image.convert("L")
-    heatmap = np.array(heatmap)
-    heatmap = np.stack([heatmap, np.zeros_like(heatmap), 255 - heatmap], axis=-1)
+    cam_resized = np.array(Image.fromarray(np.uint8(255 * cam)).resize(image_size), dtype=np.float32) / 255.0
+    if mpl_cm is not None:
+        cmap = mpl_cm.get_cmap(colormap if colormap in {"jet", "hot", "plasma", "inferno"} else "jet")
+        heatmap = (cmap(cam_resized)[..., :3] * 255).astype(np.uint8)
+        return Image.fromarray(heatmap).convert("RGB")
+    heatmap = np.stack([cam_resized * 255, np.zeros_like(cam_resized), (1.0 - cam_resized) * 255], axis=-1)
     return Image.fromarray(np.uint8(heatmap)).convert("RGB")
 
 
-def overlay_heatmap(image: Image.Image, cam: np.ndarray, enhanced: bool = True) -> Image.Image:
-    heatmap = np.array(heatmap_image(cam, image.size, enhanced=enhanced).convert("RGB"))
+def overlay_heatmap(image: Image.Image, cam: np.ndarray, enhanced: bool = True, colormap: str = "jet") -> Image.Image:
+    heatmap = np.array(heatmap_image(cam, image.size, enhanced=enhanced, colormap=colormap).convert("RGB"))
     base = np.array(image.convert("RGB"))
     if cv2 is not None:
-        overlay = cv2.addWeighted(base, 0.40, heatmap, 0.60, 0)
+        overlay = cv2.addWeighted(base, 0.65, heatmap, 0.35, 0)
         return Image.fromarray(overlay)
-    return Image.blend(image.convert("RGB"), Image.fromarray(heatmap).convert("RGB"), alpha=0.60)
+    return Image.blend(image.convert("RGB"), Image.fromarray(heatmap).convert("RGB"), alpha=0.35)
 
 
 def load_checkpoint_model(checkpoint_path: Path, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     model_name = checkpoint.get("model_name", "resnet18")
-    model = build_model(model_name, num_classes=2).to(device)
+    model = build_model(model_name, num_classes=2, pretrained=False).to(device)
     state_dict = checkpoint.get("state_dict") or checkpoint.get("model_state_dict")
     if state_dict is None:
         raise RuntimeError("Missing model weights in checkpoint (state_dict/model_state_dict)")
@@ -263,13 +287,19 @@ def main() -> None:
         choices=["penultimate", "last"],
         help="For EfficientNet, choose penultimate (features[-2]) or last (features[-1]) feature block",
     )
-    parser.add_argument("--cam-percentile-threshold", type=int, default=35)
-    parser.add_argument("--cam-blur-kernel", type=int, default=9)
+    parser.add_argument("--cam-percentile-threshold", type=int, default=75)
+    parser.add_argument("--cam-blur-kernel", type=int, default=11)
     parser.add_argument(
         "--overlay",
         default="enhanced",
         choices=["raw", "enhanced"],
         help="Overlay style",
+    )
+    parser.add_argument(
+        "--colormap",
+        default="jet",
+        choices=["jet", "hot", "plasma", "inferno", "turbo"],
+        help="Colormap for heatmap coloring",
     )
     args = parser.parse_args()
 
@@ -285,7 +315,7 @@ def main() -> None:
     model_name = checkpoint.get("model_name", "resnet18")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(model_name, num_classes=2).to(device)
+    model = build_model(model_name, num_classes=2, pretrained=False).to(device)
     state_dict = checkpoint.get("state_dict") or checkpoint.get("model_state_dict")
     if state_dict is None:
         raise SystemExit("Checkpoint missing model weights (state_dict/model_state_dict)")
@@ -317,6 +347,11 @@ def main() -> None:
                 tensor = tensor + noise
             cams.append(cam_engine.generate(tensor))
     cam = np.mean(cams, axis=0)
+    with torch.no_grad():
+        logits = model(image_to_tensor(base_image).to(device))
+        probabilities = torch.softmax(logits, dim=1)
+        predicted_idx = int(torch.argmax(probabilities, dim=1).item())
+        confidence = float(probabilities[0, predicted_idx].item())
     lesion_mask = build_lesion_mask(base_image)
     _, cam = build_cam_maps(
         cam=cam,
@@ -327,9 +362,15 @@ def main() -> None:
         blur_kernel=args.cam_blur_kernel,
     )
 
-    overlay = overlay_heatmap(base_image, cam, enhanced=args.overlay == "enhanced")
+    overlay = overlay_heatmap(base_image, cam, enhanced=args.overlay == "enhanced", colormap=args.colormap)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     overlay.save(out_path, format="PNG")
+    print(f"Training architecture: {model_name}")
+    print(f"Checkpoint loaded: {checkpoint_path}")
+    print(f"Target layer used: {args.target_layer or args.target_layer_mode}")
+    print(f"CAM method used: {method}")
+    print(f"Predicted class index: {predicted_idx}")
+    print(f"Prediction confidence: {confidence:.4f}")
     print(f"Saved Grad-CAM heatmap to {out_path}")
 
 
@@ -339,6 +380,7 @@ def test_gradcam(
     output_path: str = "outputs/debug_heatmap.jpg",
     method: str = "gradcampp",
     smooth: int = 1,
+    colormap: str = "jet",
 ):
     image_file = Path(image_path)
     checkpoint_file = Path(checkpoint_path)
@@ -377,19 +419,24 @@ def test_gradcam(
         image_size=image.size,
         lesion_mask=lesion_mask,
         apply_blur=True,
-        percentile=35,
-        blur_kernel=9,
+        percentile=75,
+        blur_kernel=11,
     )
-    overlay = overlay_heatmap(image, cam, enhanced=True)
+    raw_heatmap = heatmap_image(cam, image.size, enhanced=False, colormap=colormap)
+    overlay = overlay_heatmap(image, cam, enhanced=True, colormap=colormap)
     out_file.parent.mkdir(parents=True, exist_ok=True)
+    raw_out = out_file.with_name(f"{out_file.stem}_raw{out_file.suffix}")
+    raw_heatmap.save(raw_out)
     overlay.save(out_file)
 
     label = "ANGIOEDEMA" if predicted_idx == 1 else "URTICARIA"
     print(f"Training architecture: {model_name}")
     print(f"Checkpoint loaded: {checkpoint_file}")
     print(f"Target layer used: {target_layer_label}")
+    print(f"CAM method used: {normalized_method}")
     print(f"Predicted class: {label}")
     print(f"Confidence: {confidence:.2f}")
+    print(f"Raw heatmap saved: {raw_out}")
     print(f"Heatmap saved: {out_file}")
 
 

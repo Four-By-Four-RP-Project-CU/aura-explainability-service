@@ -77,8 +77,8 @@ class GradCamRuntime:
         enhanced_overlay: bool = True,
         target_layer_name: Optional[str] = None,
         target_layer_mode: str = "penultimate",
-        cam_percentile_threshold: int = 35,
-        cam_blur_kernel: int = 9,
+        cam_percentile_threshold: int = 40,
+        cam_blur_kernel: int = 11,
     ) -> tuple[Image.Image, Image.Image, Image.Image, Image.Image, int, float]:
         tensor = image_to_tensor(image).to(self.device)
 
@@ -93,6 +93,8 @@ class GradCamRuntime:
         method = normalize_cam_method(method)
         if target_layer_name is None and self.model_name != "efficientnet_b0":
             target_layer_name = "layer4"
+        if target_layer_name is None and self.model_name == "efficientnet_b0":
+            target_layer_name = "features[-2]" if target_layer_mode == "penultimate" else "features[-1]"
         engine_key = (method, target_layer_name, target_layer_mode)
         if engine_key not in self.gradcam_engines:
             target_layer = resolve_target_layer(
@@ -105,6 +107,13 @@ class GradCamRuntime:
                 GradCamPlusPlus(self.model, target_layer)
                 if method == "gradcampp"
                 else GradCam(self.model, target_layer)
+            )
+            logger.info(
+                "Grad-CAM engine initialized model=%s method=%s target_layer=%s mode=%s",
+                self.model_name,
+                method,
+                target_layer_name,
+                target_layer_mode,
             )
         engine = self.gradcam_engines[engine_key]
 
@@ -128,9 +137,17 @@ class GradCamRuntime:
         )
 
         raw_heatmap = heatmap_image(raw_cam, image.size, enhanced=False)
-        masked_heatmap = heatmap_image(masked_cam, image.size, enhanced=False)
-        overlay = overlay_heatmap(image, masked_cam, enhanced=False)
+        # Use broader raw CAM for clinician-facing thermal-style display.
+        masked_heatmap = heatmap_image(raw_cam, image.size, enhanced=False, colormap="jet")
+        overlay = overlay_heatmap(image, raw_cam, enhanced=False, colormap="jet")
         lesion_mask_image = Image.fromarray((lesion_mask * 255).astype("uint8")).convert("L")
+        logger.info(
+            "Grad-CAM inference predicted_idx=%d confidence=%.4f explain_idx=%d method=%s",
+            predicted_idx,
+            confidence,
+            explain_idx,
+            method,
+        )
         return raw_heatmap, masked_heatmap, overlay, lesion_mask_image, predicted_idx, confidence
 
 
@@ -167,8 +184,8 @@ def generate_heatmap(
     enhanced_overlay: bool = True,
     target_layer_name: Optional[str] = None,
     target_layer_mode: str = "penultimate",
-    cam_percentile_threshold: int = 35,
-    cam_blur_kernel: int = 9,
+    cam_percentile_threshold: int = 40,
+    cam_blur_kernel: int = 11,
 ) -> GradCamArtifacts:
     global _RUNTIME
     if _RUNTIME is None:

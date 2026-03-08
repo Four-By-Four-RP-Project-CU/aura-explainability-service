@@ -30,8 +30,8 @@ class GradcamRequest(BaseModel):
     smoothPasses: Optional[int] = 1
     targetLayer: Optional[str] = None
     targetLayerMode: Optional[str] = "penultimate"
-    camPercentileThreshold: Optional[int] = 35
-    camBlurKernel: Optional[int] = 9
+    camPercentileThreshold: Optional[int] = 40
+    camBlurKernel: Optional[int] = 11
 
 
 class GradcamResponse(BaseModel):
