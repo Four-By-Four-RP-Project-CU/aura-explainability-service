@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 HEATMAP_DIR = PROJECT_ROOT / "storage" / "heatmaps"
 HEATMAP_DIR.mkdir(parents=True, exist_ok=True)
+DEMO_HEATMAP_DIR = PROJECT_ROOT / "storage" / "heatmaps-demo"
 OVERLAY_DIR = PROJECT_ROOT / "storage" / "overlays"
 OVERLAY_DIR.mkdir(parents=True, exist_ok=True)
 BASE_IMAGE_DIR = PROJECT_ROOT / "storage" / "base_images"
@@ -151,6 +153,16 @@ class GradCamRuntime:
         return raw_heatmap, masked_heatmap, overlay, lesion_mask_image, predicted_idx, confidence
 
 
+def _find_demo_heatmap(case_id: str) -> Optional[Path]:
+    if not DEMO_HEATMAP_DIR.exists():
+        return None
+    for ext in (".png", ".jpg", ".jpeg"):
+        candidate = DEMO_HEATMAP_DIR / f"{case_id}{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def load_image(image_url: Optional[str], image_path: Optional[str]) -> Image.Image:
     if image_url:
         parsed = urlparse(image_url.strip())
@@ -187,6 +199,43 @@ def generate_heatmap(
     cam_percentile_threshold: int = 40,
     cam_blur_kernel: int = 11,
 ) -> GradCamArtifacts:
+    # Demo fallback: if a pre-generated heatmap exists for caseId, return it directly.
+    demo_heatmap = _find_demo_heatmap(case_id)
+    if demo_heatmap is not None:
+        heatmap_path = HEATMAP_DIR / f"{case_id}.png"
+        overlay_path = OVERLAY_DIR / f"{case_id}.png"
+        raw_heatmap_path = RAW_HEATMAP_DIR / f"{case_id}.png"
+        lesion_mask_path = LESION_MASK_DIR / f"{case_id}.png"
+        base_image_path = BASE_IMAGE_DIR / f"{case_id}.png"
+
+        with Image.open(demo_heatmap).convert("RGB") as demo_img:
+            demo_img.save(heatmap_path, format="PNG")
+            demo_img.save(overlay_path, format="PNG")
+            demo_img.save(raw_heatmap_path, format="PNG")
+
+        if image_url or image_path:
+            try:
+                image = load_image(image_url, image_path)
+                image.save(base_image_path, format="PNG")
+            except Exception:
+                shutil.copy2(heatmap_path, base_image_path)
+        else:
+            shutil.copy2(heatmap_path, base_image_path)
+
+        # Placeholder grayscale mask for stable API contract in demo mode.
+        with Image.open(heatmap_path) as hm:
+            Image.new("L", hm.size, color=0).save(lesion_mask_path, format="PNG")
+        logger.info("Using pre-generated demo heatmap for caseId=%s from %s", case_id, demo_heatmap)
+        return GradCamArtifacts(
+            heatmap_path=heatmap_path,
+            overlay_path=overlay_path,
+            base_image_path=base_image_path,
+            raw_heatmap_path=raw_heatmap_path,
+            lesion_mask_path=lesion_mask_path,
+            predicted_class="DEMO",
+            prediction_confidence=1.0,
+        )
+
     global _RUNTIME
     if _RUNTIME is None:
         logger.info("Loading trained Grad-CAM runtime from checkpoint")
