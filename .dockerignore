@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+storage/
+outputs/
+data/
+.claude/
+.git/
+checkpoints/best_backup_before_retrain.pt
+checkpoints/best_stage*.pt
+checkpoints/debug_*.pt
+checkpoints/stage2*.pt
+checkpoints/test_*.pt

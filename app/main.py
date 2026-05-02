@@ -69,19 +69,20 @@ def explain_gradcam(request: GradcamRequest) -> GradcamResponse:
         relative_lesion_mask_path = artifacts.lesion_mask_path.relative_to(BASE_DIR)
         api_key = os.getenv("EXPLAIN_API_KEY", "")
         key_suffix = f"?apiKey={api_key}" if api_key else ""
+        base_url = os.getenv("SERVICE_BASE_URL", "http://localhost:8001").rstrip("/")
         return GradcamResponse(
             caseId=request.caseId,
             gradCamAvailable=True,
             heatmapPath=str(relative_heatmap_path),
-            heatmapUrl=f"http://localhost:8001/files/{relative_heatmap_path}{key_suffix}",
+            heatmapUrl=f"{base_url}/files/{relative_heatmap_path}{key_suffix}",
             overlayPath=str(relative_overlay_path),
-            overlayUrl=f"http://localhost:8001/files/{relative_overlay_path}{key_suffix}",
+            overlayUrl=f"{base_url}/files/{relative_overlay_path}{key_suffix}",
             rawHeatmapPath=str(relative_raw_heatmap_path),
-            rawHeatmapUrl=f"http://localhost:8001/files/{relative_raw_heatmap_path}{key_suffix}",
+            rawHeatmapUrl=f"{base_url}/files/{relative_raw_heatmap_path}{key_suffix}",
             lesionMaskPath=str(relative_lesion_mask_path),
-            lesionMaskUrl=f"http://localhost:8001/files/{relative_lesion_mask_path}{key_suffix}",
+            lesionMaskUrl=f"{base_url}/files/{relative_lesion_mask_path}{key_suffix}",
             baseImagePath=str(relative_base_path),
-            baseImageUrl=f"http://localhost:8001/files/{relative_base_path}{key_suffix}",
+            baseImageUrl=f"{base_url}/files/{relative_base_path}{key_suffix}",
             predictedClass=artifacts.predicted_class,
             predictionConfidence=artifacts.prediction_confidence,
         )
