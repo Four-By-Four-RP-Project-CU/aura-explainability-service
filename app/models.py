@@ -26,11 +26,11 @@ class GradcamRequest(BaseModel):
     imageUrl: Optional[str] = None
     imagePath: Optional[str] = None
     targetClassIndex: Optional[int] = None
-    method: Optional[str] = "gradcampp"
+    method: Optional[str] = "eigencam"
     smoothPasses: Optional[int] = 1
     targetLayer: Optional[str] = None
     targetLayerMode: Optional[str] = "penultimate"
-    camPercentileThreshold: Optional[int] = 40
+    camPercentileThreshold: Optional[int] = 5
     camBlurKernel: Optional[int] = 11
 
 

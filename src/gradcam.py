@@ -91,11 +91,59 @@ class GradCamPlusPlus(GradCam):
         return cam.detach().cpu().numpy()
 
 
+class EigenCam:
+    """Class-agnostic CAM using SVD on feature map activations.
+
+    Does NOT depend on classifier accuracy — safe to use even when the
+    classification head predicts random outputs (e.g., under-trained model).
+    The first right singular vector of the [C × H*W] feature matrix captures
+    the dominant spatial activation pattern across all channels.
+    """
+
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self._activations: torch.Tensor | None = None
+        self._handle = self.target_layer.register_forward_hook(self._forward_hook)
+
+    def _forward_hook(self, _module, _input, output):
+        self._activations = output
+
+    def generate(self, tensor, target_index=None) -> np.ndarray:  # noqa: ARG002
+        with torch.no_grad():
+            self.model(tensor)
+
+        if self._activations is None:
+            raise RuntimeError("EigenCAM forward hook did not fire")
+
+        # Shape: [1, C, H, W] → [C, H*W]
+        acts = self._activations.squeeze(0)  # [C, H, W]
+        c, h, w = acts.shape
+        feature_matrix = acts.reshape(c, h * w).float()
+
+        # SVD — first right singular vector captures the dominant spatial pattern.
+        # Vt shape: [min(C,H*W), H*W]; Vt[0] is the first right singular vector,
+        # already a spatial map of shape [H*W] that can be directly reshaped.
+        _, _, Vt = torch.linalg.svd(feature_matrix, full_matrices=False)
+        cam = Vt[0].reshape(h, w)  # [H, W]
+        cam = cam.abs()
+        cam = cam - cam.min()
+        max_val = cam.max()
+        if max_val > 1e-8:
+            cam = cam / max_val
+        return cam.cpu().numpy()
+
+    def remove_hooks(self):
+        self._handle.remove()
+
+
 def normalize_cam_method(method: str) -> str:
-    normalized = (method or "gradcampp").strip().lower()
+    normalized = (method or "eigencam").strip().lower()
     if normalized in {"gradcam++", "gradcampp"}:
         return "gradcampp"
-    return "gradcam"
+    if normalized == "gradcam":
+        return "gradcam"
+    return "eigencam"
 
 
 def _postprocess_cam(cam: np.ndarray, enhanced: bool) -> np.ndarray:
@@ -125,6 +173,17 @@ def _resolve_cv2_colormap(colormap: str):
 
 
 def build_lesion_mask(image: Image.Image) -> np.ndarray:
+    """
+    Detect inflamed/urticaria skin regions via colour analysis.
+
+    Urticaria wheals range from deep red → salmon pink → pale-centred flares,
+    so we cast a wider net than a simple red detector:
+      1. HSV: broad red/pink hue band with low saturation floor
+      2. LAB 'a': lowered threshold to capture lighter inflammation
+      3. Relative redness: R channel significantly exceeds G and B
+    Detected regions are dilated to include wheal borders, then the mask is
+    blended with the original to avoid sharp edges on the heatmap.
+    """
     rgb = np.array(image.convert("RGB"))
     h, w = rgb.shape[:2]
 
@@ -132,30 +191,121 @@ def build_lesion_mask(image: Image.Image) -> np.ndarray:
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
 
-        mask_red_low = cv2.inRange(hsv, (0, 30, 30), (20, 255, 255))
-        mask_red_high = cv2.inRange(hsv, (160, 30, 30), (179, 255, 255))
+        # Wider hue range + lower saturation floor to catch pink/salmon wheals.
+        mask_red_low = cv2.inRange(hsv, (0, 20, 50), (25, 255, 255))
+        mask_red_high = cv2.inRange(hsv, (155, 20, 50), (179, 255, 255))
         mask_red = cv2.bitwise_or(mask_red_low, mask_red_high)
 
-        # LAB 'a' channel tends to increase on reddish/inflamed regions.
-        mask_lab = (lab[:, :, 1] > 145).astype(np.uint8) * 255
-        mask = cv2.bitwise_or(mask_red, mask_lab)
+        # LAB 'a' channel — lowered threshold from 145 → 130 to pick up
+        # lighter inflammatory tones.
+        mask_lab = (lab[:, :, 1] > 130).astype(np.uint8) * 255
 
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-        lesion_mask = (mask > 0).astype(np.float32)
-    else:
-        # Fallback without cv2: simple redness proxy.
+        # Relative redness: pixels where R significantly exceeds G and B.
         r = rgb[:, :, 0].astype(np.int16)
         g = rgb[:, :, 1].astype(np.int16)
         b = rgb[:, :, 2].astype(np.int16)
-        lesion_mask = ((r - g > 12) & (r - b > 6)).astype(np.float32)
+        mask_redness = (((r - g) > 10) & ((r - b) > 5) & (r.astype(np.uint16) > 80)).astype(np.uint8) * 255
+
+        mask = cv2.bitwise_or(mask_red, mask_lab)
+        mask = cv2.bitwise_or(mask, mask_redness)
+
+        # Morphological clean-up: remove noise, then connect nearby lesion blobs.
+        open_k = np.ones((3, 3), np.uint8)
+        close_k = np.ones((9, 9), np.uint8)
+        dilate_k = np.ones((15, 15), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k)
+        # Dilate to include wheal borders and surrounding erythema.
+        mask = cv2.dilate(mask, dilate_k, iterations=1)
+
+        lesion_mask = (mask > 0).astype(np.float32)
+
+        # Soften mask edges so the heatmap blends naturally into clean skin.
+        lesion_mask = cv2.GaussianBlur(lesion_mask, (21, 21), 0)
+        if lesion_mask.max() > 0:
+            lesion_mask = lesion_mask / lesion_mask.max()
+    else:
+        # Fallback without cv2: relative redness proxy.
+        r = rgb[:, :, 0].astype(np.int16)
+        g = rgb[:, :, 1].astype(np.int16)
+        b = rgb[:, :, 2].astype(np.int16)
+        lesion_mask = (((r - g) > 10) & ((r - b) > 5)).astype(np.float32)
 
     # Avoid degenerate fully-empty masks by falling back to full-image.
     if lesion_mask.mean() < 0.01:
         lesion_mask = np.ones((h, w), dtype=np.float32)
     return lesion_mask
+
+
+def build_skin_mask(image: Image.Image) -> np.ndarray:
+    """
+    Detect the entire visible skin area (all skin tones, not just inflamed regions).
+
+    Uses YCbCr + HSV skin-tone ranges so the heatmap covers the complete skin
+    surface.  EigenCAM values then determine warm (lesion) vs cool (healthy skin)
+    colouring, producing the full-coverage thermal gradient look.
+    """
+    rgb = np.array(image.convert("RGB"))
+    h, w = rgb.shape[:2]
+
+    if cv2 is not None:
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
+
+        # YCbCr skin range — reliable across a wide range of skin tones.
+        mask_ycc = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
+
+        # HSV skin range: warm hues (0-30°), low-medium saturation, not too dark.
+        mask_hsv_low = cv2.inRange(hsv, (0, 8, 60), (30, 200, 255))
+        # Include high-hue wrap (350-360°) for some skin tones.
+        mask_hsv_high = cv2.inRange(hsv, (165, 8, 60), (179, 200, 255))
+        mask_hsv = cv2.bitwise_or(mask_hsv_low, mask_hsv_high)
+
+        mask = cv2.bitwise_or(mask_ycc, mask_hsv)
+
+        # Fill holes, remove small specks, then expand to cover skin borders.
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        mask = cv2.dilate(mask, np.ones((9, 9), np.uint8), iterations=1)
+
+        skin_mask = (mask > 0).astype(np.float32)
+        skin_mask = cv2.GaussianBlur(skin_mask, (21, 21), 0)
+        if skin_mask.max() > 0:
+            skin_mask = skin_mask / skin_mask.max()
+    else:
+        lum = rgb.mean(axis=2)
+        skin_mask = (lum > 50).astype(np.float32)
+
+    if skin_mask.mean() < 0.05:
+        skin_mask = np.ones((h, w), dtype=np.float32)
+    return skin_mask
+
+
+def redness_cam(image: Image.Image) -> np.ndarray:
+    """
+    Erythema heatmap via CIE LAB a* channel — identical approach to the
+    companion AURA recognition service (IT22577160/app/explain.py).
+
+    The a* channel measures red-green opposition: the reddest/most inflamed
+    skin area maps to 1.0, the least red area maps to 0.0.  This is
+    class-agnostic and requires no model gradient, so it is robust even
+    when the classifier has low accuracy.  For urticaria the resulting
+    heatmap shows a clinically meaningful erythema gradient across the
+    entire skin surface.
+    """
+    rgb = np.array(image.convert("RGB"))
+    if cv2 is not None:
+        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+        a = lab[:, :, 1].astype(np.float32)
+    else:
+        # Approximate a* without cv2: use (R - G) as a redness proxy.
+        r = rgb[:, :, 0].astype(np.float32)
+        g = rgb[:, :, 1].astype(np.float32)
+        a = r - g + 128.0
+
+    a_min, a_max = a.min(), a.max()
+    cam = (a - a_min) / (a_max - a_min + 1e-6)
+    return cam.astype(np.float32)
 
 
 def _resize_cam(cam: np.ndarray, image_size: tuple[int, int]) -> np.ndarray:
@@ -226,9 +376,14 @@ def overlay_heatmap(image: Image.Image, cam: np.ndarray, enhanced: bool = True, 
     heatmap = np.array(heatmap_image(cam, image.size, enhanced=enhanced, colormap=colormap).convert("RGB"))
     base = np.array(image.convert("RGB"))
     if cv2 is not None:
-        overlay = cv2.addWeighted(base, 0.65, heatmap, 0.35, 0)
-        return Image.fromarray(overlay)
-    return Image.blend(image.convert("RGB"), Image.fromarray(heatmap).convert("RGB"), alpha=0.35)
+        # 55% original + 45% heatmap — same ratio as AURA recognition service.
+        # The dark background stays dark (original is already dark there);
+        # skin regions get the full thermal gradient.
+        heatmap_bgr = cv2.cvtColor(heatmap, cv2.COLOR_RGB2BGR)
+        base_bgr = cv2.cvtColor(base, cv2.COLOR_RGB2BGR)
+        overlay_bgr = cv2.addWeighted(base_bgr, 0.55, heatmap_bgr, 0.45, 0)
+        return Image.fromarray(cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB))
+    return Image.blend(image.convert("RGB"), Image.fromarray(heatmap).convert("RGB"), alpha=0.45)
 
 
 def load_checkpoint_model(checkpoint_path: Path, device: torch.device):
@@ -272,7 +427,7 @@ def main() -> None:
     parser.add_argument("--image", required=True, help="Absolute path to image")
     parser.add_argument("--checkpoint", default="checkpoints/best.pt")
     parser.add_argument("--out", required=True, help="Output path for heatmap PNG")
-    parser.add_argument("--method", default="gradcampp", choices=["gradcam", "gradcampp", "gradcam++"])
+    parser.add_argument("--method", default="eigencam", choices=["gradcam", "gradcampp", "gradcam++", "eigencam"])
     parser.add_argument("--tta", type=int, default=1, help="Use test-time augmentation (1=off, 2=flip)")
     parser.add_argument("--smooth", type=int, default=0, help="SmoothGrad-CAM++ passes (0=off)")
     parser.add_argument(
@@ -329,7 +484,9 @@ def main() -> None:
         args.target_layer,
         target_layer_mode=args.target_layer_mode,
     )
-    if method == "gradcampp":
+    if method == "eigencam":
+        cam_engine = EigenCam(model, target_layer)
+    elif method == "gradcampp":
         cam_engine = GradCamPlusPlus(model, target_layer)
     else:
         cam_engine = GradCam(model, target_layer)
@@ -396,7 +553,12 @@ def test_gradcam(
     target_layer = resolve_target_layer(model, model_name, target_layer_label, target_layer_mode="penultimate")
 
     normalized_method = normalize_cam_method(method)
-    engine = GradCamPlusPlus(model, target_layer) if normalized_method == "gradcampp" else GradCam(model, target_layer)
+    if normalized_method == "eigencam":
+        engine = EigenCam(model, target_layer)
+    elif normalized_method == "gradcampp":
+        engine = GradCamPlusPlus(model, target_layer)
+    else:
+        engine = GradCam(model, target_layer)
     image = Image.open(image_file).convert("RGB")
     tensor = image_to_tensor(image).to(device)
 

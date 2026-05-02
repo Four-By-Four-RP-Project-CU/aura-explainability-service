@@ -55,11 +55,11 @@ def explain_gradcam(request: GradcamRequest) -> GradcamResponse:
             request.imageUrl,
             request.imagePath,
             target_class_index=request.targetClassIndex,
-            method=(request.method or "gradcampp"),
+            method=(request.method or "eigencam"),
             smooth_passes=(request.smoothPasses or 1),
             target_layer_name=request.targetLayer,
             target_layer_mode=(request.targetLayerMode or "penultimate"),
-            cam_percentile_threshold=(request.camPercentileThreshold or 40),
+            cam_percentile_threshold=(request.camPercentileThreshold or 5),
             cam_blur_kernel=(request.camBlurKernel or 11),
         )
         relative_heatmap_path = artifacts.heatmap_path.relative_to(BASE_DIR)

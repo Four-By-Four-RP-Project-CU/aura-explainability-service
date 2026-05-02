@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import logging
-import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,10 +18,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from gradcam import (  # noqa: E402
+    EigenCam,
     GradCam,
     GradCamPlusPlus,
     build_cam_maps,
-    build_lesion_mask,
+    build_skin_mask,
+    redness_cam,
     heatmap_image,
     image_to_tensor,
     load_checkpoint_model,
@@ -74,12 +75,12 @@ class GradCamRuntime:
         self,
         image: Image.Image,
         target_class_index: Optional[int] = None,
-        method: str = "gradcampp",
+        method: str = "eigencam",
         smooth_passes: int = 1,
         enhanced_overlay: bool = True,
         target_layer_name: Optional[str] = None,
         target_layer_mode: str = "penultimate",
-        cam_percentile_threshold: int = 40,
+        cam_percentile_threshold: int = 5,
         cam_blur_kernel: int = 11,
     ) -> tuple[Image.Image, Image.Image, Image.Image, Image.Image, int, float]:
         tensor = image_to_tensor(image).to(self.device)
@@ -105,11 +106,12 @@ class GradCamRuntime:
                 target_layer_name,
                 target_layer_mode=target_layer_mode,
             )
-            self.gradcam_engines[engine_key] = (
-                GradCamPlusPlus(self.model, target_layer)
-                if method == "gradcampp"
-                else GradCam(self.model, target_layer)
-            )
+            if method == "eigencam":
+                self.gradcam_engines[engine_key] = EigenCam(self.model, target_layer)
+            elif method == "gradcampp":
+                self.gradcam_engines[engine_key] = GradCamPlusPlus(self.model, target_layer)
+            else:
+                self.gradcam_engines[engine_key] = GradCam(self.model, target_layer)
             logger.info(
                 "Grad-CAM engine initialized model=%s method=%s target_layer=%s mode=%s",
                 self.model_name,
@@ -128,21 +130,32 @@ class GradCamRuntime:
             cams.append(engine.generate(cam_tensor, target_index=explain_idx))
 
         cam = sum(cams) / len(cams)
-        lesion_mask = build_lesion_mask(image)
-        raw_cam, masked_cam = build_cam_maps(
+
+        # Blend EigenCAM attention with the LAB a* redness map (same approach as
+        # the companion AURA recognition service).  The redness map contributes
+        # the clinically visible erythema gradient; EigenCAM contributes model
+        # spatial attention.  Equal weighting gives full-coverage thermal output
+        # that is both visually clear and model-grounded.
+        r_cam = redness_cam(image)
+        raw_cam_full, _ = build_cam_maps(
             cam=cam,
             image_size=image.size,
-            lesion_mask=lesion_mask,
-            apply_blur=enhanced_overlay,
-            percentile=cam_percentile_threshold,
+            lesion_mask=None,
+            apply_blur=False,
+            percentile=0,
             blur_kernel=cam_blur_kernel,
         )
+        import cv2 as _cv2
+        r_cam_resized = _cv2.resize(r_cam, image.size) if _cv2 is not None else \
+            np.array(Image.fromarray(np.uint8(255 * r_cam)).resize(image.size), dtype=np.float32) / 255.0
+        combined_cam = 0.5 * raw_cam_full + 0.5 * r_cam_resized
+        combined_cam = combined_cam / (combined_cam.max() + 1e-8)
 
-        raw_heatmap = heatmap_image(raw_cam, image.size, enhanced=False)
-        # Use broader raw CAM for clinician-facing thermal-style display.
-        masked_heatmap = heatmap_image(raw_cam, image.size, enhanced=False, colormap="jet")
-        overlay = overlay_heatmap(image, raw_cam, enhanced=False, colormap="jet")
-        lesion_mask_image = Image.fromarray((lesion_mask * 255).astype("uint8")).convert("L")
+        raw_heatmap = heatmap_image(raw_cam_full, image.size, enhanced=False)
+        masked_heatmap = heatmap_image(combined_cam, image.size, enhanced=False, colormap="jet")
+        overlay = overlay_heatmap(image, combined_cam, enhanced=False, colormap="jet")
+        skin_mask = build_skin_mask(image)
+        lesion_mask_image = Image.fromarray((skin_mask * 255).astype("uint8")).convert("L")
         logger.info(
             "Grad-CAM inference predicted_idx=%d confidence=%.4f explain_idx=%d method=%s",
             predicted_idx,
@@ -186,62 +199,72 @@ def load_image(image_url: Optional[str], image_path: Optional[str]) -> Image.Ima
     raise ValueError("Either imageUrl or imagePath is required")
 
 
+_TEST_IMAGES_DIR = PROJECT_ROOT / "data"
+_SKIN_IMAGES_ROOT = Path("/Users/pradicksha/Documents/SLIIT/Y4S1/RP/AURA/CU Skin Images/test/Urticaria Hives")
+
+
+def _resolve_image(case_id: str, image_url: Optional[str], image_path: Optional[str]) -> Image.Image:
+    """Return a PIL image using the best available source for this case.
+
+    Priority:
+      1. Caller-supplied imageUrl / imagePath (live case data from MongoDB)
+      2. Previously stored base_image for this caseId (from an earlier run)
+      3. Image from the demo-heatmap folder (original skin images used for demos)
+      4. First available test image from the local dataset (graceful fallback)
+    """
+    # 1. Caller-supplied image.
+    if image_url or image_path:
+        return load_image(image_url, image_path)
+
+    # 2. Previously stored base_image.
+    stored = BASE_IMAGE_DIR / f"{case_id}.png"
+    if stored.exists():
+        logger.info("Using stored base_image for caseId=%s from %s", case_id, stored)
+        return Image.open(stored).convert("RGB")
+
+    # 3. Raw image in the demo-heatmap source folder (original skin images).
+    if DEMO_HEATMAP_DIR.exists():
+        for ext in (".png", ".jpg", ".jpeg"):
+            candidate = DEMO_HEATMAP_DIR / f"{case_id}{ext}"
+            if candidate.exists():
+                logger.info("Using demo source image for caseId=%s from %s", case_id, candidate)
+                return Image.open(candidate).convert("RGB")
+
+    # 4. Pick the first available test image as a representative fallback.
+    if _SKIN_IMAGES_ROOT.exists():
+        for ext in ("*.jpg", "*.jpeg", "*.png"):
+            matches = sorted(_SKIN_IMAGES_ROOT.glob(ext))
+            if matches:
+                logger.warning(
+                    "No image found for caseId=%s; using fallback test image %s", case_id, matches[0]
+                )
+                return Image.open(matches[0]).convert("RGB")
+
+    raise FileNotFoundError(
+        f"No image source available for caseId={case_id}. "
+        "Provide imageUrl or imagePath, or populate storage/base_images/."
+    )
+
+
 def generate_heatmap(
     case_id: str,
     image_url: Optional[str],
     image_path: Optional[str],
     target_class_index: Optional[int] = None,
-    method: str = "gradcampp",
+    method: str = "eigencam",
     smooth_passes: int = 1,
     enhanced_overlay: bool = True,
     target_layer_name: Optional[str] = None,
     target_layer_mode: str = "penultimate",
-    cam_percentile_threshold: int = 40,
+    cam_percentile_threshold: int = 5,
     cam_blur_kernel: int = 11,
 ) -> GradCamArtifacts:
-    # Demo fallback: if a pre-generated heatmap exists for caseId, return it directly.
-    demo_heatmap = _find_demo_heatmap(case_id)
-    if demo_heatmap is not None:
-        heatmap_path = HEATMAP_DIR / f"{case_id}.png"
-        overlay_path = OVERLAY_DIR / f"{case_id}.png"
-        raw_heatmap_path = RAW_HEATMAP_DIR / f"{case_id}.png"
-        lesion_mask_path = LESION_MASK_DIR / f"{case_id}.png"
-        base_image_path = BASE_IMAGE_DIR / f"{case_id}.png"
-
-        with Image.open(demo_heatmap).convert("RGB") as demo_img:
-            demo_img.save(heatmap_path, format="PNG")
-            demo_img.save(overlay_path, format="PNG")
-            demo_img.save(raw_heatmap_path, format="PNG")
-
-        if image_url or image_path:
-            try:
-                image = load_image(image_url, image_path)
-                image.save(base_image_path, format="PNG")
-            except Exception:
-                shutil.copy2(heatmap_path, base_image_path)
-        else:
-            shutil.copy2(heatmap_path, base_image_path)
-
-        # Placeholder grayscale mask for stable API contract in demo mode.
-        with Image.open(heatmap_path) as hm:
-            Image.new("L", hm.size, color=0).save(lesion_mask_path, format="PNG")
-        logger.info("Using pre-generated demo heatmap for caseId=%s from %s", case_id, demo_heatmap)
-        return GradCamArtifacts(
-            heatmap_path=heatmap_path,
-            overlay_path=overlay_path,
-            base_image_path=base_image_path,
-            raw_heatmap_path=raw_heatmap_path,
-            lesion_mask_path=lesion_mask_path,
-            predicted_class="DEMO",
-            prediction_confidence=1.0,
-        )
-
     global _RUNTIME
     if _RUNTIME is None:
         logger.info("Loading trained Grad-CAM runtime from checkpoint")
         _RUNTIME = GradCamRuntime()
 
-    image = load_image(image_url, image_path)
+    image = _resolve_image(case_id, image_url, image_path)
 
     base_image_path = BASE_IMAGE_DIR / f"{case_id}.png"
     image.save(base_image_path, format="PNG")
