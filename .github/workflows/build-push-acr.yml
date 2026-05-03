@@ -23,5 +23,3 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: auraexplain.azurecr.io/aura-explainability:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
