@@ -10,3 +10,4 @@ torchvision==0.19.1
 pillow==10.4.0
 requests==2.32.3
 opencv-python-headless==4.10.0.84
+huggingface_hub==0.23.4
