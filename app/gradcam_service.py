@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,33 @@ CLASS_LABELS = {0: "URTICARIA", 1: "ANGIOEDEMA"}
 _RUNTIME: Optional["GradCamRuntime"] = None
 
 
+def _ensure_checkpoint() -> None:
+    if CHECKPOINT_PATH.exists():
+        return
+    hf_repo = os.getenv("HF_REPO_ID", "").strip()
+    hf_token = os.getenv("HF_TOKEN", "").strip() or None
+    if not hf_repo:
+        raise FileNotFoundError(
+            f"Checkpoint not found: {CHECKPOINT_PATH}. "
+            "Set HF_REPO_ID env var to download from Hugging Face."
+        )
+    logger.info("Checkpoint not found locally. Downloading from Hugging Face repo: %s", hf_repo)
+    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from huggingface_hub import hf_hub_download
+        downloaded = hf_hub_download(
+            repo_id=hf_repo,
+            filename="best.pt",
+            token=hf_token,
+            local_dir=str(CHECKPOINT_PATH.parent),
+        )
+        logger.info("Checkpoint downloaded to: %s", downloaded)
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"Failed to download checkpoint from Hugging Face ({hf_repo}): {exc}"
+        ) from exc
+
+
 @dataclass
 class GradCamArtifacts:
     heatmap_path: Path
@@ -65,6 +93,7 @@ class GradCamArtifacts:
 class GradCamRuntime:
     # Loads checkpoint once at startup and reuses model/hooks for all requests.
     def __init__(self) -> None:
+        _ensure_checkpoint()
         if not CHECKPOINT_PATH.exists():
             raise FileNotFoundError(f"Checkpoint not found: {CHECKPOINT_PATH}")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
